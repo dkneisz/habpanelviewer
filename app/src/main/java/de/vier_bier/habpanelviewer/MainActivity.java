@@ -26,6 +26,7 @@ import android.preference.PreferenceManager;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.ContextMenu;
+import android.view.Display;
 import android.view.Gravity;
 import android.view.LayoutInflater;
 import android.view.MenuInflater;
@@ -455,6 +456,8 @@ public class MainActivity extends ScreenControllingActivity
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+
         if (requestCode == Constants.REQUEST_PICK_APPLICATION && resultCode == RESULT_OK) {
             startActivity(data);
         } else if (requestCode == Constants.REQUEST_MEDIA_PROJECTION) {
@@ -585,7 +588,8 @@ public class MainActivity extends ScreenControllingActivity
 
         final SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(MainActivity.this);
         boolean pauseWebview = prefs.getBoolean(Constants.PREF_PAUSE_WEBVIEW, false);
-        if (pauseWebview && !((PowerManager) getSystemService(POWER_SERVICE)).isInteractive()) {
+        Display display = getWindowManager().getDefaultDisplay();
+        if (pauseWebview && display.getState() != Display.STATE_ON) {
             mWebView.pause();
         }
         super.onPause();
@@ -594,9 +598,7 @@ public class MainActivity extends ScreenControllingActivity
     @Override
     protected void onResume() {
         super.onResume();
-
-        final SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(MainActivity.this);
-        mWebView.resume(prefs.getBoolean(Constants.PREF_LOAD_START_URL_ON_SCREENON, false));
+        mWebView.resume();
 
         if (mService != null) {
             mService.stopForeground(true);

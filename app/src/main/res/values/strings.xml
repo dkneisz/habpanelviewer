@@ -366,4 +366,6 @@
     <string name="initCertStore">Initializing certificate store…</string>
     <string name="starting">Starting…</string>
     <string name="prefsDisabledMissingPermissions">Preferences have been disabled because permissions are missing!</string>
+    <string name="webviewPaused">WebView paused</string>
+    <string name="resumeShortly">The webview has been paused and will resume to work shortly.</string>
 </resources>

@@ -3,6 +3,7 @@ package de.vier_bier.habpanelviewer;
 import android.app.Activity;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.graphics.Bitmap;
 import android.net.http.SslCertificate;
 import android.net.http.SslError;
 import android.text.InputType;
@@ -18,24 +19,37 @@ import android.webkit.SslErrorHandler;
 import android.webkit.WebBackForwardList;
 import android.webkit.WebChromeClient;
 import android.webkit.WebHistoryItem;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.EditText;
 
+import androidx.annotation.Nullable;
 import androidx.appcompat.app.AlertDialog;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.MalformedURLException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
+import java.net.URLConnection;
 import java.text.SimpleDateFormat;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+import javax.net.ssl.HttpsURLConnection;
+
+import de.vier_bier.habpanelviewer.connection.ConnectionStatistics;
 import de.vier_bier.habpanelviewer.db.CredentialManager;
 import de.vier_bier.habpanelviewer.openhab.ISseConnectionListener;
 import de.vier_bier.habpanelviewer.openhab.IUrlListener;
 import de.vier_bier.habpanelviewer.openhab.SseConnection;
 import de.vier_bier.habpanelviewer.connection.ssl.CertificateManager;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
 
 /**
  * WebView
@@ -46,6 +60,7 @@ public class ClientWebView extends WebView implements NetworkTracker.INetworkLis
 
     private boolean mAllowMixedContent;
     private boolean mDraggingPrevented;
+    private boolean mLoadStartUrlOnResume;
     private String mServerURL;
     private String mStartPage;
     private boolean mKioskMode;
@@ -58,7 +73,7 @@ public class ClientWebView extends WebView implements NetworkTracker.INetworkLis
     private boolean mAllowWebRTC;
 
     private String mPauseUrl;
-    private boolean mPaused;
+    private AtomicBoolean mPaused = new AtomicBoolean();
 
     public ClientWebView(Context context, AttributeSet attrs) {
         super(context, attrs);
@@ -101,7 +116,7 @@ public class ClientWebView extends WebView implements NetworkTracker.INetworkLis
         setWebChromeClient(new WebChromeClient() {
             @Override
             public boolean onConsoleMessage(ConsoleMessage consoleMessage) {
-                if (mTrackBrowserConnection && !mPaused && consoleMessage.message().contains("SSE error, closing EventSource")) {
+                if (mTrackBrowserConnection && !mPaused.get() && consoleMessage.message().contains("SSE error, closing EventSource")) {
                     cl.statusChanged(SseConnection.Status.FAILURE);
                 }
                 return !mLogBrowserMsg || super.onConsoleMessage(consoleMessage);
@@ -118,6 +133,29 @@ public class ClientWebView extends WebView implements NetworkTracker.INetworkLis
         });
 
         setWebViewClient(new WebViewClient() {
+//            @Nullable
+//            @Override
+//            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+//                WebResourceResponse response = super.shouldInterceptRequest(view, request);
+//
+//                if (request.getUrl().toString().endsWith("/rest/events?topics=smarthome/items/*/statechanged,smarthome/items/*/*/statechanged,smarthome/webaudio/playurl")) {
+//                    try {
+//                        OkHttpClient client = ConnectionStatistics.OkHttpClientFactory.getInstance().create();
+//                        Request or = new Request.Builder()
+//                                .url(request.getUrl().toString())
+//                                .build();
+//                        Response resp = client.newCall(or).execute();
+//
+//                        if (resp.code() == 200) {
+//                            return new WebResourceResponse(resp.body().contentType().toString(),  "utf-8", new DelegatingInputStream(resp.body().byteStream()));
+//                        }
+//                    } catch (IOException e) {
+//                        e.printStackTrace();
+//                    }
+//                }
+//
+//                return response;
+//            }
 
             @Override
             public void onPageFinished(WebView view, String url) {
@@ -131,12 +169,12 @@ public class ClientWebView extends WebView implements NetworkTracker.INetworkLis
                                 s -> mKioskMode = Boolean.parseBoolean(s));
                     }
                     Log.d(TAG, "habpanel page loaded. url=" + url + ", kioskMode=" + mKioskMode);
-                    if (!mPaused) {
+                    if (!mPaused.get()) {
                         ul.changed(url, true);
                     }
                 } else {
                     Log.d(TAG, "external page loaded. url=" + url);
-                    if (!mPaused) {
+                    if (!mPaused.get()) {
                         ul.changed(url, false);
                     }
                 }
@@ -260,6 +298,7 @@ public class ClientWebView extends WebView implements NetworkTracker.INetworkLis
         boolean cacheDeactivated = prefs.getBoolean(Constants.PREF_DISABLE_CACHE, false);
 
         mDraggingPrevented = prefs.getBoolean(Constants.PREF_PREVENT_DRAGGING, false);
+        mLoadStartUrlOnResume = prefs.getBoolean(Constants.PREF_LOAD_START_URL_ON_SCREENON, false);
 
         WebSettings webSettings = getSettings();
         webSettings.setUseWideViewPort(isDesktop);
@@ -498,23 +537,20 @@ public class ClientWebView extends WebView implements NetworkTracker.INetworkLis
     }
 
     public void pause() {
-        if (!mPaused) {
+        if (!mPaused.getAndSet(true)) {
             Log.d(TAG, "pausing webview...");
-
             mPauseUrl = getUrl();
-            mPaused = true;
 
-            //showHtml("Webview paused","The webview has been paused and will resume to work shortly.");
-            super.loadUrl("about:blank");
+            showHtml(getContext().getString(R.string.webviewPaused),
+                    getContext().getString(R.string.resumeShortly));
         }
     }
 
-    public void resume(boolean loadStartOnScreenOn) {
-        if (mPaused) {
+    public void resume() {
+        if (mPaused.getAndSet(false)) {
             Log.d(TAG, "resuming webview...");
 
-            mPaused = false;
-            if (mPauseUrl == START_URL || loadStartOnScreenOn) {
+            if (mPauseUrl == START_URL || mLoadStartUrlOnResume) {
                 loadStartUrl();
             } else {
                 loadUrl(mPauseUrl);
@@ -525,7 +561,7 @@ public class ClientWebView extends WebView implements NetworkTracker.INetworkLis
 
     @Override
     public void loadUrl(String url) {
-        if (mPaused) {
+        if (mPaused.get()) {
             mPauseUrl = url;
         } else {
             super.loadUrl(url);
@@ -533,7 +569,7 @@ public class ClientWebView extends WebView implements NetworkTracker.INetworkLis
     }
 
     public void loadStartUrl() {
-        if (mPaused) {
+        if (mPaused.get()) {
             mPauseUrl = START_URL;
         } else {
             String url = mStartPage;
@@ -556,6 +592,60 @@ public class ClientWebView extends WebView implements NetworkTracker.INetworkLis
                     loadUrl(startPage);
                 }
             });
+        }
+    }
+
+    private static class DelegatingInputStream extends InputStream {
+        InputStream mDelegate;
+
+        DelegatingInputStream(InputStream data) {
+            mDelegate = data;
+        }
+
+        @Override
+        public int read(byte[] b) throws IOException {
+            return mDelegate.read(b);
+        }
+
+        @Override
+        public int read(byte[] b, int off, int len) throws IOException {
+            int cnt= mDelegate.read(b, off, len);
+            return cnt;
+        }
+
+        @Override
+        public long skip(long n) throws IOException {
+            return mDelegate.skip(n);
+        }
+
+        @Override
+        public int available() throws IOException {
+            return mDelegate.available();
+        }
+
+        @Override
+        public void close() throws IOException {
+            mDelegate.close();
+        }
+
+        @Override
+        public synchronized void mark(int readlimit) {
+            super.mark(readlimit);
+        }
+
+        @Override
+        public synchronized void reset() throws IOException {
+            super.reset();
+        }
+
+        @Override
+        public boolean markSupported() {
+            return super.markSupported();
+        }
+
+        @Override
+        public int read() throws IOException {
+            return 0;
         }
     }
 }
