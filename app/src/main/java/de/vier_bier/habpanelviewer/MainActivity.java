@@ -588,8 +588,7 @@ public class MainActivity extends ScreenControllingActivity
 
         final SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(MainActivity.this);
         boolean pauseWebview = prefs.getBoolean(Constants.PREF_PAUSE_WEBVIEW, false);
-        Display display = getWindowManager().getDefaultDisplay();
-        if (pauseWebview && display.getState() != Display.STATE_ON) {
+        if (pauseWebview && !((PowerManager) getSystemService(POWER_SERVICE)).isInteractive()) {
             mWebView.pause();
         }
         super.onPause();

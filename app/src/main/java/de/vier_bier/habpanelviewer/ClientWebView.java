@@ -3,7 +3,6 @@ package de.vier_bier.habpanelviewer;
 import android.app.Activity;
 import android.content.Context;
 import android.content.SharedPreferences;
-import android.graphics.Bitmap;
 import android.net.http.SslCertificate;
 import android.net.http.SslError;
 import android.text.InputType;
@@ -29,26 +28,19 @@ import android.widget.EditText;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AlertDialog;
 
-import java.io.IOException;
-import java.io.InputStream;
+import java.io.ByteArrayInputStream;
 import java.net.MalformedURLException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URL;
-import java.net.URLConnection;
 import java.text.SimpleDateFormat;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import javax.net.ssl.HttpsURLConnection;
-
-import de.vier_bier.habpanelviewer.connection.ConnectionStatistics;
+import de.vier_bier.habpanelviewer.connection.ssl.CertificateManager;
 import de.vier_bier.habpanelviewer.db.CredentialManager;
 import de.vier_bier.habpanelviewer.openhab.ISseConnectionListener;
 import de.vier_bier.habpanelviewer.openhab.IUrlListener;
 import de.vier_bier.habpanelviewer.openhab.SseConnection;
-import de.vier_bier.habpanelviewer.connection.ssl.CertificateManager;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
 import okhttp3.Response;
 
 /**
@@ -72,7 +64,6 @@ public class ClientWebView extends WebView implements NetworkTracker.INetworkLis
     private boolean mLogBrowserMsg;
     private boolean mAllowWebRTC;
 
-    private String mPauseUrl;
     private AtomicBoolean mPaused = new AtomicBoolean();
 
     public ClientWebView(Context context, AttributeSet attrs) {
@@ -133,29 +124,20 @@ public class ClientWebView extends WebView implements NetworkTracker.INetworkLis
         });
 
         setWebViewClient(new WebViewClient() {
-//            @Nullable
-//            @Override
-//            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-//                WebResourceResponse response = super.shouldInterceptRequest(view, request);
-//
-//                if (request.getUrl().toString().endsWith("/rest/events?topics=smarthome/items/*/statechanged,smarthome/items/*/*/statechanged,smarthome/webaudio/playurl")) {
-//                    try {
-//                        OkHttpClient client = ConnectionStatistics.OkHttpClientFactory.getInstance().create();
-//                        Request or = new Request.Builder()
-//                                .url(request.getUrl().toString())
-//                                .build();
-//                        Response resp = client.newCall(or).execute();
-//
-//                        if (resp.code() == 200) {
-//                            return new WebResourceResponse(resp.body().contentType().toString(),  "utf-8", new DelegatingInputStream(resp.body().byteStream()));
-//                        }
-//                    } catch (IOException e) {
-//                        e.printStackTrace();
-//                    }
-//                }
-//
-//                return response;
-//            }
+            @Nullable
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                WebResourceResponse response = super.shouldInterceptRequest(view, request);
+
+                if (mPaused.get()) {
+                    if (request.getUrl().toString().endsWith("/rest/events?topics=smarthome/items/*/statechanged,smarthome/items/*/*/statechanged,smarthome/webaudio/playurl")
+                            || request.getUrl().toString().endsWith("/rest/items") && mPaused.get()) {
+                        return new WebResourceResponse("text/event-stream", "UTF-8", new ByteArrayInputStream(new byte[0]));
+                    }
+                }
+
+                return response;
+            }
 
             @Override
             public void onPageFinished(WebView view, String url) {
@@ -539,10 +521,14 @@ public class ClientWebView extends WebView implements NetworkTracker.INetworkLis
     public void pause() {
         if (!mPaused.getAndSet(true)) {
             Log.d(TAG, "pausing webview...");
-            mPauseUrl = getUrl();
 
-            showHtml(getContext().getString(R.string.webviewPaused),
-                    getContext().getString(R.string.resumeShortly));
+            if (isShowingHabPanel()) {
+                Log.d(TAG, "dropping sse subscription..");
+
+                // reload items as this creates a new sse subscription which will be handled above
+                // and replaced with an empty response as longs as we are paused
+                evaluateJavascript("angular.element(document.body).injector().get('OHService').reloadItems();", null);
+            }
         }
     }
 
@@ -550,102 +536,38 @@ public class ClientWebView extends WebView implements NetworkTracker.INetworkLis
         if (mPaused.getAndSet(false)) {
             Log.d(TAG, "resuming webview...");
 
-            if (mPauseUrl == START_URL || mLoadStartUrlOnResume) {
+            if (mLoadStartUrlOnResume) {
+                Log.d(TAG, "loading start url...");
                 loadStartUrl();
-            } else {
-                loadUrl(mPauseUrl);
-            }
-            mPauseUrl = null;
-        }
-    }
+            } else if (isShowingHabPanel()) {
+                Log.d(TAG, "triggering sse subscription..");
 
-    @Override
-    public void loadUrl(String url) {
-        if (mPaused.get()) {
-            mPauseUrl = url;
-        } else {
-            super.loadUrl(url);
+                // reload items as this creates a new sse subscription
+                evaluateJavascript("angular.element(document.body).injector().get('OHService').reloadItems();", null);
+            }
         }
     }
 
     public void loadStartUrl() {
-        if (mPaused.get()) {
-            mPauseUrl = START_URL;
-        } else {
-            String url = mStartPage;
-            if ("".equals(url)) {
-                url = mServerURL;
+        String url = mStartPage;
+        if ("".equals(url)) {
+            url = mServerURL;
+        }
+
+        if (url == null || "".equals(url)) {
+            post(() -> showHtml(getContext().getString(R.string.configMissing),
+                    getContext().getString(R.string.startPageNotSetHTML)));
+            return;
+        }
+
+        final String startPage = url;
+        mKioskMode = isHabPanelUrl(startPage) && startPage.toLowerCase().contains("kiosk=on");
+        Log.d(TAG, "loadStartUrl: loading start page " + startPage + "...");
+
+        post(() -> {
+            if (getUrl() == null || !startPage.equalsIgnoreCase(getUrl())) {
+                loadUrl(startPage);
             }
-
-            if (url == null || "".equals(url)) {
-                post(() -> showHtml(getContext().getString(R.string.configMissing),
-                        getContext().getString(R.string.startPageNotSetHTML)));
-                return;
-            }
-
-            final String startPage = url;
-            mKioskMode = isHabPanelUrl(startPage) && startPage.toLowerCase().contains("kiosk=on");
-            Log.d(TAG, "loadStartUrl: loading start page " + startPage + "...");
-
-            post(() -> {
-                if (getUrl() == null || !startPage.equalsIgnoreCase(getUrl())) {
-                    loadUrl(startPage);
-                }
-            });
-        }
-    }
-
-    private static class DelegatingInputStream extends InputStream {
-        InputStream mDelegate;
-
-        DelegatingInputStream(InputStream data) {
-            mDelegate = data;
-        }
-
-        @Override
-        public int read(byte[] b) throws IOException {
-            return mDelegate.read(b);
-        }
-
-        @Override
-        public int read(byte[] b, int off, int len) throws IOException {
-            int cnt= mDelegate.read(b, off, len);
-            return cnt;
-        }
-
-        @Override
-        public long skip(long n) throws IOException {
-            return mDelegate.skip(n);
-        }
-
-        @Override
-        public int available() throws IOException {
-            return mDelegate.available();
-        }
-
-        @Override
-        public void close() throws IOException {
-            mDelegate.close();
-        }
-
-        @Override
-        public synchronized void mark(int readlimit) {
-            super.mark(readlimit);
-        }
-
-        @Override
-        public synchronized void reset() throws IOException {
-            super.reset();
-        }
-
-        @Override
-        public boolean markSupported() {
-            return super.markSupported();
-        }
-
-        @Override
-        public int read() throws IOException {
-            return 0;
-        }
+        });
     }
 }
